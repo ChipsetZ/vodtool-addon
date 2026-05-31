@@ -1,11 +1,14 @@
 --[[
   VodSync — precision timestamp overlay for VOD synchronisation
   ─────────────────────────────────────────────────────────────
-  Shows three lines in the top-left corner at the start of each boss pull:
+  Shows one short line in the top-left corner at the start of each boss pull:
 
-    1775499538.402       ← Unix time (seconds.ms) — primary OCR target
-    868004.732           ← GetTime() client uptime — high-precision anchor
-    18:19:43  06/04      ← Human-readable UTC time / date — visual fallback
+    1779210806.402       ← Unix time (seconds.ms) — OCR sync anchor
+
+  Renders as opaque white digits on a solid black plate so an OCR pipeline
+  (downscaled to 720p, lanczos upscaled, tesseract) can read it reliably.
+  The plate is small enough not to obscure raid frames, but bright enough
+  to survive grayscale + contrast steps.
 
   Fires on ENCOUNTER_START, auto-hides after SHOW_DURATION seconds.
   Use /vodsync test to preview without a boss pull.
@@ -14,42 +17,49 @@
 --]]
 
 -- ── Configuration ─────────────────────────────────────────────────────────────
-local ALPHA         = 0.15   -- opacity: 0.08 (barely visible) to 0.25 (readable)
-local FONT_SIZE     = 14     -- larger = better OCR; 14 readable without being intrusive
-local FONT_PATH     = "Fonts\\FRIZQT__.TTF"
-local FONT_FLAGS    = "MONOCHROME,OUTLINE"
+local PLATE_ALPHA   = 1.0    -- background plate opacity (0..1). 1.0 = best OCR.
+local TEXT_ALPHA    = 1.0    -- timestamp text opacity (0..1). 1.0 = best OCR.
+local FONT_SIZE     = 22     -- larger digits = OCR robust against downscale
+local FONT_PATH     = "Fonts\\ARIALN.TTF" -- narrow monospace-ish, clean digit forms
+local FONT_FLAGS    = "OUTLINE"
+local PAD_X         = 6      -- plate horizontal padding around text (px)
+local PAD_Y         = 3      -- plate vertical padding around text (px)
 local UPDATE_HZ     = 30     -- updates per second
 local SHOW_DURATION = 5      -- seconds to show overlay after pull starts
 -- ──────────────────────────────────────────────────────────────────────────────
 
 -- On by default every session. /vodsync off to hide for this session only.
--- Relogging resets it back to on.
 local enabled   = true
-local showTimer = 0   -- counts down from SHOW_DURATION; overlay visible while > 0
+local showTimer = 0
 
 local frame = CreateFrame("Frame", "VodSyncFrame", UIParent)
--- TOOLTIP is the highest normal-use strata; FULLSCREEN_DIALOG would also work
--- but blocks parts of the UI Blizzard considers dialog-level. We want the
--- overlay visually on top of raid frames, unit frames, action bars, etc.,
--- which all sit at MEDIUM or HIGH at most. Frame level 1000 within TOOLTIP
--- pushes us above other TOOLTIP-strata frames if any addon shares this strata.
+-- TOOLTIP strata + frameLevel 1000 keep us above raid frames, action bars, etc.
 frame:SetFrameStrata("TOOLTIP")
 frame:SetFrameLevel(1000)
 frame:SetAllPoints(UIParent)
-frame:SetIgnoreParentScale(true) -- avoid being shrunk by UIParent scale changes
-frame:SetIgnoreParentAlpha(true) -- avoid being faded by parent alpha (e.g. cinematics)
+frame:SetIgnoreParentScale(true)
+frame:SetIgnoreParentAlpha(true)
 frame:RegisterEvent("ENCOUNTER_START")
 frame:RegisterEvent("ENCOUNTER_END")
 
+-- Solid black plate sized to text. Drawn under the FontString so the digits
+-- sit on a uniform high-contrast background — survives grayscale conversion.
+local plate = frame:CreateTexture(nil, "BACKGROUND")
+plate:SetColorTexture(0, 0, 0, PLATE_ALPHA)
+plate:Hide()
+
 local text = frame:CreateFontString(nil, "OVERLAY")
-text:SetDrawLayer("OVERLAY", 7) -- topmost sublevel within OVERLAY draw layer
+text:SetDrawLayer("OVERLAY", 7)
 text:SetFont(FONT_PATH, FONT_SIZE, FONT_FLAGS)
-text:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 6, -6)
-text:SetTextColor(1, 1, 1, ALPHA)
+text:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 6 + PAD_X, -6 - PAD_Y)
+text:SetTextColor(1, 1, 1, TEXT_ALPHA)
 text:SetJustifyH("LEFT")
 text:Hide()
 
--- Re-assert top strata if another addon yanks us down (rare but cheap insurance)
+-- Anchor the plate to fit the text snugly with PAD_*.
+plate:SetPoint("TOPLEFT",     text, "TOPLEFT",     -PAD_X, PAD_Y)
+plate:SetPoint("BOTTOMRIGHT", text, "BOTTOMRIGHT",  PAD_X, -PAD_Y)
+
 local function ensureTop()
     if frame:GetFrameStrata() ~= "TOOLTIP" then
         frame:SetFrameStrata("TOOLTIP")
@@ -59,25 +69,30 @@ local function ensureTop()
     end
 end
 
--- Sync GetServerTime (integer Unix seconds) with GetTime (float uptime) once
--- at load so we can interpolate sub-second precision on the Unix timestamp.
-local serverBase = GetServerTime()   -- Unix seconds, integer
-local clientBase = GetTime()         -- WoW uptime seconds, float
+-- Sync GetServerTime (integer Unix seconds) with GetTime (float uptime) so we
+-- can interpolate sub-second precision. Re-anchored on every ENCOUNTER_START
+-- so loading screens / alt-tabs that pause GetTime can't cause the overlay to
+-- drift behind real wall-clock — at most 5s (SHOW_DURATION) of drift is
+-- possible within the visible window.
+local serverBase = GetServerTime()
+local clientBase = GetTime()
 
 local ticker = 0
 
 frame:SetScript("OnEvent", function(_, event)
     if event == "ENCOUNTER_START" then
+        serverBase = GetServerTime()
+        clientBase = GetTime()
         showTimer = SHOW_DURATION
         ensureTop()
     elseif event == "ENCOUNTER_END" then
         showTimer = 0
         text:Hide()
+        plate:Hide()
     end
 end)
 
 frame:SetScript("OnUpdate", function(_, dt)
-    -- Drain the show timer regardless of throttle
     if showTimer > 0 then
         showTimer = showTimer - dt
     end
@@ -89,35 +104,21 @@ frame:SetScript("OnUpdate", function(_, dt)
     local _, instanceType = IsInInstance()
     if not enabled or instanceType ~= "raid" or showTimer <= 0 then
         text:Hide()
+        plate:Hide()
         return
     end
 
-    local clientNow = GetTime()
-
-    -- ── Line 1: Unix timestamp seconds.milliseconds ──────────────────────────
-    local unixFloat = serverBase + (clientNow - clientBase)
-    local line1 = string.format("%.3f", unixFloat)
-
-    -- ── Line 2: GetTime() client uptime ──────────────────────────────────────
-    local line2 = string.format("%.3f", clientNow)
-
-    -- ── Line 3: HH:MM:SS  DD/MM  (derived from unixFloat) ───────────────────
-    local secs = math.floor(unixFloat)
-    local hh   = math.floor(secs / 3600) % 24
-    local mm   = math.floor(secs / 60)   % 60
-    local ss   = secs % 60
-    local ddmm = date("%d/%m")
-    local line3 = string.format("%02d:%02d:%02d  %s", hh, mm, ss, ddmm)
-
-    text:SetText(line1 .. "\n" .. line2 .. "\n" .. line3)
+    local unixFloat = serverBase + (GetTime() - clientBase)
+    text:SetText(string.format("%.3f", unixFloat))
     text:Show()
+    plate:Show()
 end)
 
 -- ── Slash command ─────────────────────────────────────────────────────────────
 --   /vodsync          → toggle on/off
 --   /vodsync on|off   → explicit
---   /vodsync 0.15     → set opacity (0.01–1.0)
---   /vodsync test     → show overlay for SHOW_DURATION (preview without a pull)
+--   /vodsync 0.85     → set plate+text alpha (0.01–1.0). 1.0 is best for OCR.
+--   /vodsync test     → preview overlay for SHOW_DURATION seconds
 SLASH_VODSYNC1 = "/vodsync"
 SlashCmdList["VODSYNC"] = function(msg)
     msg = strtrim(msg):lower()
@@ -126,6 +127,7 @@ SlashCmdList["VODSYNC"] = function(msg)
         enabled   = false
         showTimer = 0
         text:Hide()
+        plate:Hide()
         print("|cff00ff00VodSync|r off for this session (resets on relog)")
 
     elseif msg == "on" then
@@ -133,26 +135,27 @@ SlashCmdList["VODSYNC"] = function(msg)
         print("|cff00ff00VodSync|r on")
 
     elseif msg == "test" then
-        -- Preview without needing an actual boss pull (works anywhere in a raid)
         showTimer = SHOW_DURATION
         ensureTop()
         print(string.format("|cff00ff00VodSync|r showing for %d seconds (test)", SHOW_DURATION))
 
     elseif msg == "" then
         enabled = not enabled
-        if not enabled then showTimer = 0; text:Hide() end
+        if not enabled then showTimer = 0; text:Hide(); plate:Hide() end
         print("|cff00ff00VodSync|r " .. (enabled and "on" or "off for this session (resets on relog)"))
 
     else
         local val = tonumber(msg)
         if val and val >= 0.01 and val <= 1.0 then
-            ALPHA = val
-            text:SetTextColor(1, 1, 1, ALPHA)
-            print(string.format("|cff00ff00VodSync|r opacity set to %.2f", ALPHA))
+            PLATE_ALPHA = val
+            TEXT_ALPHA  = val
+            plate:SetColorTexture(0, 0, 0, PLATE_ALPHA)
+            text:SetTextColor(1, 1, 1, TEXT_ALPHA)
+            print(string.format("|cff00ff00VodSync|r opacity set to %.2f", val))
         else
             print("|cff00ff00VodSync|r  /vodsync          — toggle on/off")
             print("|cff00ff00VodSync|r  /vodsync on|off   — explicit")
-            print("|cff00ff00VodSync|r  /vodsync 0.15     — set opacity")
+            print("|cff00ff00VodSync|r  /vodsync 0.85     — set opacity (1.0 is best for OCR)")
             print(string.format("|cff00ff00VodSync|r  /vodsync test     — preview for %ds", SHOW_DURATION))
         end
     end
